@@ -58,6 +58,171 @@ else:
 
 import serial # pyserial version???
 
+
+import socket
+from typing import Optional, Tuple, Any
+class UdpStream:
+    """
+    A custom class that encapsulates UDP communication but exposes a
+    Stream-like interface (similar to pyserial) for libraries
+    that expect a serial port object.
+    """
+
+    # Set a large buffer size to prevent UDP packet truncation
+    # This must be larger than the maximum expected MSP frame size.
+    BUFFER_SIZE = 1472
+
+    def __init__(self, remote_ip: str, remote_port: int, local_port: int):
+        """
+        Initializes the UDP socket for communication.
+
+        :param remote_ip: The IP address of the ESP32.
+        :param remote_port: The port the ESP32 is listening on (e.g., 4200).
+        :param local_port: The port the PC will bind to for receiving data (e.g., 4201).
+        """
+        self.remote_addr: Tuple[str, int] = (remote_ip, remote_port)
+        self.local_port: int = local_port
+        self.sock: Optional[socket.socket] = None
+        self.buffer: bytes = b''
+
+
+    def open(self):
+        # 1. Setup the socket
+        try:
+            # AF_INET for IPv4, SOCK_DGRAM for UDP
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Bind to the local port so the ESP32 knows where to send data back
+            self.sock.bind(('', self.local_port))
+            # Set a timeout for non-blocking behavior
+            self.sock.settimeout(0.1)
+            print(f"UdpStream bound to local port {self.local_port} for receiving.")
+
+        except Exception as e:
+            print(f"Error setting up UDP socket: {e}")
+            self.sock = None
+
+    def close(self):
+        """Closes the UDP socket."""
+        if self.sock:
+            self.sock.close()
+            print("UdpStream closed.")
+            self.sock = None
+
+    def write(self, data: bytes) -> int:
+        """
+        Mimics serial.write(). Sends the data as a single UDP datagram
+        to the remote address (ESP32).
+
+        :param data: The bytes to send.
+        :return: The number of bytes sent.
+        """
+        if self.sock:
+            return self.sock.sendto(data, self.remote_addr)
+        return 0
+
+    def inWaiting(self) -> int:
+        """
+        Mimics serial.inWaiting(). Returns the number of bytes currently
+        in the internal buffer. Since UDP is datagram-oriented, this
+        buffer management is crucial.
+        """
+        # If the internal buffer is empty, try to fetch a new datagram
+        if not self.buffer:
+            self._fetch_next_datagram()
+
+        return len(self.buffer)
+
+    def _fetch_next_datagram(self):
+        """
+        Internal method to pull one complete datagram from the network
+        and store it in the internal buffer.
+        """
+        if self.sock:
+            try:
+                # Recvfrom reads ONE datagram up to BUFFER_SIZE.
+                # This must be large enough to prevent truncation.
+                data, _ = self.sock.recvfrom(self.BUFFER_SIZE)
+                self.buffer += data
+            except socket.timeout:
+                # No data waiting, buffer remains empty
+                pass
+            except Exception as e:
+                # Handle other socket errors
+                print(f"Error fetching datagram: {e}")
+
+    def read(self, size: int = 1) -> bytes:
+        """
+        Mimics serial.read(). Reads 'size' bytes from the internal buffer.
+        It attempts to fetch a new datagram if the buffer is empty.
+
+        :param size: The maximum number of bytes to read.
+        :return: The bytes read.
+        """
+        # Ensure we have enough data to satisfy the read request (if possible)
+        while len(self.buffer) < size:
+            # Check if there's any data waiting on the socket
+            if not self.sock:
+                return b''
+
+            self._fetch_next_datagram()
+
+            # If after attempting to fetch, the buffer is still empty,
+            # or we haven't reached the requested size, break and return
+            # what we have (non-blocking read behavior).
+            if not self.buffer:
+                break
+
+        # Slice the data out of the buffer
+        data_to_read = self.buffer[:size]
+        # Remove the read data from the buffer
+        self.buffer = self.buffer[size:]
+
+        return data_to_read
+
+    # Use the Python context manager protocol (e.g., 'with UdpStream(...) as stream:')
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any):
+        self.close()
+
+# --- Example Usage ---
+# ESP32_IP = "192.168.1.100"
+# ESP32_PORT = 4200
+# PC_LISTEN_PORT = 4201
+
+# try:
+#     # Instantiate your custom stream object
+#     udp_stream = UdpStream(ESP32_IP, ESP32_PORT, PC_LISTEN_PORT)
+
+#     # --- 1. Send initial command to ESP32 to start streaming ---
+#     request_command = "REQUEST_DATA"
+#     udp_stream.write(request_command.encode('utf-8'))
+#     print(f"Sent: {request_command}")
+
+#     # --- 2. Pass the udp_stream object to the MSP library ---
+#     # MSP_Parser(udp_stream)
+
+#     # --- 3. Example of continuous reading ---
+#     # In a loop, the MSP library will call read() or inWaiting()
+#     for i in range(20):
+#         # The MSP library might try to read 1 byte at a time
+#         byte = udp_stream.read(1)
+#
+#         # Or it might check the buffer before reading a large chunk
+#         if udp_stream.inWaiting() >= 10:
+#              chunk = udp_stream.read(10)
+#              print(f"Read 10-byte chunk: {chunk}")
+#
+#         time.sleep(0.05) # simulate processing time
+
+# except Exception as e:
+#     print(f"An error occurred: {e}")
+# finally:
+#     # Ensure the socket is closed
+#     if 'udp_stream' in locals() and udp_stream.sock:
+#         udp_stream.close()
+
 class MSPy:
 
     # Dictionary with all the possible codes
@@ -298,7 +463,7 @@ class MSPy:
 
     JUMBO_FRAME_SIZE_LIMIT = 255
 
-    def __init__(self, device, baudrate=115200, trials=1, 
+    def __init__(self, my_port, fc_ip, fc_port, trials=1,
                  logfilename='MSPy.log', logfilemode='a', loglevel='DEBUG'):
         """
         Parameters
@@ -855,17 +1020,17 @@ class MSPy:
         #                           inter_byte_timeout=None,
         #                           exclusive=None)
 
-        self.conn = serial.Serial()
-        self.conn.port = device
-        self.conn.baudrate = baudrate
-        self.conn.bytesize = serial.EIGHTBITS
-        self.conn.parity = serial.PARITY_NONE
-        self.conn.stopbits = serial.STOPBITS_ONE
-        self.conn.timeout = 1
-        self.conn.xonxoff = False
-        self.conn.rtscts = False
-        self.conn.dsrdtr = False
-        self.conn.writeTimeout = 1
+        self.conn = UdpStream(remote_ip=fc_ip, remote_port=fc_port, local_port=my_port)
+        #self.conn.port = device
+        #self.conn.baudrate = baudrate
+        #self.conn.bytesize = serial.EIGHTBITS
+        #self.conn.parity = serial.PARITY_NONE
+        #self.conn.stopbits = serial.STOPBITS_ONE
+        #self.conn.timeout = 1
+        #self.conn.xonxoff = False
+        #self.conn.rtscts = False
+        #self.conn.dsrdtr = False
+        #self.conn.writeTimeout = 1
 
         self.ser_trials = trials
 
@@ -874,79 +1039,13 @@ class MSPy:
 
 
     def __enter__(self):
-        self.is_serial_open = not self.connect(trials=self.ser_trials)
-
-        if self.is_serial_open:
-            return self
-        else:
-            logging.warning("Serial port ({}) not ready/available".format(self.conn.port))
-            return 1
+        self.conn.open()
+        return self
 
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if not self.conn.closed:
-            self.conn.close()
+        self.conn.close()
 
-
-    def connect(self, trials=100, delay=0.5):
-        """Opens the serial connection with the board
-
-        Parameters
-        ----------
-        trials : int
-            Number of times it should try openning the serial port before giving up (default is 1)
-
-        delay : float
-            Time between trials
-            
-        Returns
-        -------
-        int
-            0 if successful or 1 if not
-        """
-
-        for _ in range(trials):
-            try:
-                self.conn.open()
-                self.basic_info()
-                return 0
-                
-            except serial.SerialException as err:
-                logging.warning("Error opening the serial port ({0}): {1}".format(self.conn.port, err))
-            
-            except FileNotFoundError as err:
-                logging.warning("Port ({0}) not found: {1}".format(self.conn.port, err))
-
-            time.sleep(delay)
-        
-        return 1
-
-
-    def basic_info(self):
-        """Basic info about the flight controller to distinguish between the many flavours.
-        """
-        for msg in ['MSP_API_VERSION', 'MSP_FC_VARIANT']:
-            if self.send_RAW_msg(MSPy.MSPCodes[msg], data=[]):
-                dataHandler = self.receive_msg()
-                self.process_recv_data(dataHandler)
-
-        if 'INAV' in self.CONFIG['flightControllerIdentifier']:
-            self.INAV = True
-        else:
-            self.INAV = False
-
-        basic_info_cmd_list = ['MSP_FC_VERSION', 'MSP_BUILD_INFO', 'MSP_BOARD_INFO', 'MSP_UID', 
-                               'MSP_ACC_TRIM', 'MSP_NAME', 'MSP_STATUS', 'MSP_STATUS_EX']
-        if self.INAV:
-            basic_info_cmd_list.append('MSPV2_INAV_ANALOG')
-            basic_info_cmd_list.append('MSP_VOLTAGE_METER_CONFIG')
-
-        for msg in basic_info_cmd_list:
-            if self.send_RAW_msg(MSPy.MSPCodes[msg], data=[]):
-                dataHandler = self.receive_msg()
-                self.process_recv_data(dataHandler)
-    
-        print(self.CONFIG)
 
     def fast_read_altitude(self):
         # Request altitude
